@@ -33,6 +33,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/clock"
 	"k8s.io/apimachinery/pkg/util/naming"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -52,6 +53,8 @@ type Reflector struct {
 
 	// The type of object we expect to place in the store.
 	expectedType reflect.Type
+	// The GroupVersionKind if expectedType is a runtime.Object
+	gvk schema.GroupVersionKind
 	// The destination to sync up with the watch source
 	store Store
 	// listerWatcher is used to perform lists and watches.
@@ -109,6 +112,9 @@ func NewNamedReflector(name string, lw ListerWatcher, expectedType interface{}, 
 		resyncPeriod:  resyncPeriod,
 		clock:         &clock.RealClock{},
 	}
+	if obj, ok := expectedType.(runtime.Object); ok == true {
+		r.gvk = obj.GetObjectKind().GroupVersionKind()
+	}
 	return r
 }
 
@@ -119,7 +125,7 @@ var internalPackages = []string{"client-go/tools/cache/"}
 // Run starts a watch and handles watch events. Will restart the watch if it is closed.
 // Run will exit when stopCh is closed.
 func (r *Reflector) Run(stopCh <-chan struct{}) {
-	klog.V(3).Infof("Starting reflector %v (%s) from %s", r.expectedType, r.resyncPeriod, r.name)
+	klog.V(3).Infof("Starting reflector %v (%s) (%s) from %s", r.expectedType, r.gvk, r.resyncPeriod, r.name)
 	wait.Until(func() {
 		if err := r.ListAndWatch(stopCh); err != nil {
 			utilruntime.HandleError(err)
@@ -157,7 +163,7 @@ func (r *Reflector) resyncChan() (<-chan time.Time, func() bool) {
 // and then use the resource version to watch.
 // It returns error if ListAndWatch didn't even try to initialize watch.
 func (r *Reflector) ListAndWatch(stopCh <-chan struct{}) error {
-	klog.V(3).Infof("Listing and watching %v from %s", r.expectedType, r.name)
+	klog.V(3).Infof("Listing and watching %v (%s) from %s", r.expectedType, r.gvk, r.name)
 	var resourceVersion string
 
 	// Explicitly set "0" as resource version - it's fine for the List()
@@ -198,7 +204,7 @@ func (r *Reflector) ListAndWatch(stopCh <-chan struct{}) error {
 		case <-listCh:
 		}
 		if err != nil {
-			return fmt.Errorf("%s: Failed to list %v: %v", r.name, r.expectedType, err)
+			return fmt.Errorf("%s: Failed to list %v (%s): %v", r.name, r.expectedType, r.gvk, err)
 		}
 		initTrace.Step("Objects listed")
 		listMetaInterface, err := meta.ListAccessor(list)
@@ -277,9 +283,9 @@ func (r *Reflector) ListAndWatch(stopCh <-chan struct{}) error {
 			case io.EOF:
 				// watch closed normally
 			case io.ErrUnexpectedEOF:
-				klog.V(1).Infof("%s: Watch for %v closed with unexpected EOF: %v", r.name, r.expectedType, err)
+				klog.V(1).Infof("%s: Watch for %v (%s) closed with unexpected EOF: %v", r.name, r.expectedType, r.gvk, err)
 			default:
-				utilruntime.HandleError(fmt.Errorf("%s: Failed to watch %v: %v", r.name, r.expectedType, err))
+				utilruntime.HandleError(fmt.Errorf("%s: Failed to watch %v (%s): %v", r.name, r.expectedType, r.gvk, err))
 			}
 			// If this is "connection refused" error, it means that most likely apiserver is not responsive.
 			// It doesn't make sense to re-list all objects because most likely we will be able to restart
@@ -300,9 +306,9 @@ func (r *Reflector) ListAndWatch(stopCh <-chan struct{}) error {
 			if err != errorStopRequested {
 				switch {
 				case apierrs.IsResourceExpired(err):
-					klog.V(4).Infof("%s: watch of %v ended with: %v", r.name, r.expectedType, err)
+					klog.V(4).Infof("%s: watch of %v (%s) ended with: %v", r.name, r.expectedType, r.gvk, err)
 				default:
-					klog.Warningf("%s: watch of %v ended with: %v", r.name, r.expectedType, err)
+					klog.Warningf("%s: watch of %v (%s) ended with: %v", r.name, r.expectedType, r.gvk, err)
 				}
 			}
 			return nil
@@ -343,7 +349,7 @@ loop:
 				return apierrs.FromObject(event.Object)
 			}
 			if e, a := r.expectedType, reflect.TypeOf(event.Object); e != nil && e != a {
-				utilruntime.HandleError(fmt.Errorf("%s: expected type %v, but watch event object had type %v", r.name, e, a))
+				utilruntime.HandleError(fmt.Errorf("%s: expected type %v (%s), but watch event object had type %v", r.name, e, r.gvk, a))
 				continue
 			}
 			meta, err := meta.Accessor(event.Object)
@@ -386,7 +392,7 @@ loop:
 	if watchDuration < 1*time.Second && eventCount == 0 {
 		return fmt.Errorf("very short watch: %s: Unexpected watch close - watch lasted less than a second and no items received", r.name)
 	}
-	klog.V(4).Infof("%s: Watch close - %v total %v items received", r.name, r.expectedType, eventCount)
+	klog.V(4).Infof("%s: Watch close - %v (%s) total %v items received", r.name, r.expectedType, r.gvk, eventCount)
 	return nil
 }
 
